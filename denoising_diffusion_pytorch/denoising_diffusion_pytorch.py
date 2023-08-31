@@ -3,10 +3,8 @@ import copy
 from pathlib import Path
 from random import random
 from functools import partial
-from collections import namedtuple
 from multiprocessing import cpu_count
 
-import torch
 from torch import nn, einsum
 from torch.cuda.amp import autocast
 import torch.nn.functional as F
@@ -29,6 +27,12 @@ from denoising_diffusion_pytorch.attend import Attend
 from denoising_diffusion_pytorch.fid_evaluation import FIDEvaluation
 
 from denoising_diffusion_pytorch.version import __version__
+import pickle
+from collections import namedtuple
+
+import torch
+from torch.utils.data import Dataset
+import lmdb
 
 # constants
 
@@ -89,19 +93,20 @@ def unnormalize_to_zero_to_one(t):
 def Upsample(dim, dim_out = None):
     return nn.Sequential(
         nn.Upsample(scale_factor = 2, mode = 'nearest'),
-        nn.Conv2d(dim, default(dim_out, dim), 3, padding = 1)
+        nn.Conv3d(dim, default(dim_out, dim), 3, padding = 1)
     )
 
 def Downsample(dim, dim_out = None):
     return nn.Sequential(
         Rearrange('b c (h p1) (w p2) -> b (c p1 p2) h w', p1 = 2, p2 = 2),
-        nn.Conv2d(dim * 4, default(dim_out, dim), 1)
+        nn.Conv3d(dim * 4, default(dim_out, dim), 1)
     )
 
 class RMSNorm(nn.Module):
     def __init__(self, dim):
         super().__init__()
-        self.g = nn.Parameter(torch.ones(1, dim, 1, 1))
+        # self.g = nn.Parameter(torch.ones(1, dim, 1, 1))
+        self.g = nn.Parameter(torch.ones(1, dim, 1, 1, 1))
 
     def forward(self, x):
         return F.normalize(x, dim = 1) * self.g * (x.shape[1] ** 0.5)
@@ -144,7 +149,7 @@ class RandomOrLearnedSinusoidalPosEmb(nn.Module):
 class Block(nn.Module):
     def __init__(self, dim, dim_out, groups = 8):
         super().__init__()
-        self.proj = nn.Conv2d(dim, dim_out, 3, padding = 1)
+        self.proj = nn.Conv3d(dim, dim_out, 3, padding = 1)
         self.norm = nn.GroupNorm(groups, dim_out)
         self.act = nn.SiLU()
 
@@ -169,7 +174,7 @@ class ResnetBlock(nn.Module):
 
         self.block1 = Block(dim, dim_out, groups = groups)
         self.block2 = Block(dim_out, dim_out, groups = groups)
-        self.res_conv = nn.Conv2d(dim, dim_out, 1) if dim != dim_out else nn.Identity()
+        self.res_conv = nn.Conv3d(dim, dim_out, 1) if dim != dim_out else nn.Identity()
 
     def forward(self, x, time_emb = None):
 
@@ -198,10 +203,10 @@ class LinearAttention(nn.Module):
         hidden_dim = dim_head * heads
 
         self.norm = RMSNorm(dim)
-        self.to_qkv = nn.Conv2d(dim, hidden_dim * 3, 1, bias = False)
+        self.to_qkv = nn.Conv3d(dim, hidden_dim * 3, 1, bias = False)
 
         self.to_out = nn.Sequential(
-            nn.Conv2d(hidden_dim, dim, 1),
+            nn.Conv3d(hidden_dim, dim, 1),
             RMSNorm(dim)
         )
 
@@ -239,8 +244,8 @@ class Attention(nn.Module):
         self.norm = RMSNorm(dim)
         self.attend = Attend(flash = flash)
 
-        self.to_qkv = nn.Conv2d(dim, hidden_dim * 3, 1, bias = False)
-        self.to_out = nn.Conv2d(hidden_dim, dim, 1)
+        self.to_qkv = nn.Conv3d(dim, hidden_dim * 3, 1, bias = False)
+        self.to_out = nn.Conv3d(hidden_dim, dim, 1)
 
     def forward(self, x):
         b, c, h, w = x.shape
@@ -264,7 +269,7 @@ class Unet(nn.Module):
         init_dim = None,
         out_dim = None,
         dim_mults = (1, 2, 4, 8),
-        channels = 3,
+        channels = 1,
         self_condition = False,
         resnet_block_groups = 8,
         learned_variance = False,
@@ -285,7 +290,7 @@ class Unet(nn.Module):
         input_channels = channels * (2 if self_condition else 1)
 
         init_dim = default(init_dim, dim)
-        self.init_conv = nn.Conv2d(input_channels, init_dim, 7, padding = 3)
+        self.init_conv = nn.Conv3d(input_channels, init_dim, 7, padding = 3)
 
         dims = [init_dim, *map(lambda m: dim * m, dim_mults)]
         in_out = list(zip(dims[:-1], dims[1:]))
@@ -338,7 +343,7 @@ class Unet(nn.Module):
                 block_klass(dim_in, dim_in, time_emb_dim = time_dim),
                 block_klass(dim_in, dim_in, time_emb_dim = time_dim),
                 attn_klass(dim_in, dim_head = layer_attn_dim_head, heads = layer_attn_heads),
-                Downsample(dim_in, dim_out) if not is_last else nn.Conv2d(dim_in, dim_out, 3, padding = 1)
+                Downsample(dim_in, dim_out) if not is_last else nn.Conv3d(dim_in, dim_out, 3, padding = 1)
             ]))
 
         mid_dim = dims[-1]
@@ -355,14 +360,14 @@ class Unet(nn.Module):
                 block_klass(dim_out + dim_in, dim_out, time_emb_dim = time_dim),
                 block_klass(dim_out + dim_in, dim_out, time_emb_dim = time_dim),
                 attn_klass(dim_out, dim_head = layer_attn_dim_head, heads = layer_attn_heads),
-                Upsample(dim_out, dim_in) if not is_last else  nn.Conv2d(dim_out, dim_in, 3, padding = 1)
+                Upsample(dim_out, dim_in) if not is_last else  nn.Conv3d(dim_out, dim_in, 3, padding = 1)
             ]))
 
         default_out_dim = channels * (1 if not learned_variance else 2)
         self.out_dim = default(out_dim, default_out_dim)
 
         self.final_res_block = block_klass(dim * 2, dim, time_emb_dim = time_dim)
-        self.final_conv = nn.Conv2d(dim, self.out_dim, 1)
+        self.final_conv = nn.Conv3d(dim, self.out_dim, 1)
 
     @property
     def downsample_factor(self):
@@ -715,7 +720,7 @@ class GaussianDiffusion(nn.Module):
     def sample(self, batch_size = 16, return_all_timesteps = False):
         image_size, channels = self.image_size, self.channels
         sample_fn = self.p_sample_loop if not self.is_ddim_sampling else self.ddim_sample
-        return sample_fn((batch_size, channels, image_size, image_size), return_all_timesteps = return_all_timesteps)
+        return sample_fn((batch_size, channels, image_size, image_size,image_size), return_all_timesteps = return_all_timesteps)
 
     @torch.inference_mode()
     def interpolate(self, x1, x2, t = None, lam = 0.5):
@@ -802,6 +807,33 @@ class GaussianDiffusion(nn.Module):
         return self.p_losses(img, t, *args, **kwargs)
 
 # dataset classes
+class LMDBDataset(Dataset):
+    def __init__(self, path):
+        self.env = lmdb.open(
+            path,
+            max_readers=32,
+            readonly=True,
+            lock=False,
+            readahead=False,
+            meminit=False,
+        )
+
+        if not self.env:
+            raise IOError('Cannot open lmdb dataset', path)
+
+        with self.env.begin(write=False) as txn:
+            self.length = int(txn.get('length'.encode('utf-8')).decode('utf-8'))
+
+    def __len__(self):
+        return self.length
+
+    def __getitem__(self, index):
+        with self.env.begin(write=False) as txn:
+            key = str(index).encode('utf-8')
+
+            row = pickle.loads(txn.get(key))
+
+        return torch.from_numpy(row.top), torch.from_numpy(row.bottom), row.filename
 
 class Dataset(Dataset):
     def __init__(
@@ -896,11 +928,11 @@ class Trainer(object):
 
         # dataset and dataloader
 
-        self.ds = Dataset(folder, self.image_size, augment_horizontal_flip = augment_horizontal_flip, convert_image_to = convert_image_to)
+        self.ds = LMDBDataset(folder)
 
         assert len(self.ds) >= 100, 'you should have at least 100 images in your folder. at least 10k images recommended'
 
-        dl = DataLoader(self.ds, batch_size = train_batch_size, shuffle = True, pin_memory = True, num_workers = cpu_count())
+        dl = DataLoader(self.ds, batch_size = train_batch_size, shuffle = True, pin_memory = True, num_workers = cpu_count(),drop_last=True)
 
         dl = self.accelerator.prepare(dl)
         self.dl = cycle(dl)
